@@ -5,6 +5,8 @@ from io import StringIO
 import os
 import json
 import subprocess
+import asyncio
+from api_request_parallel_processor import process_api_requests_from_file
 
 def parallel_request(messages, model, temperature, api_key, max_requests_per_minute = 200, max_tokens_per_minute = 4000, max_attempts = 5, logging_level = 10):
     """
@@ -89,11 +91,44 @@ def execute_prompts(data):
     response_tokens = 500  # Dummy value
     return response_tokens
 
+
+def test_run(api_key):
+    
+    requests_filepath = 'gpt-example.jsonl'
+    save_filepath = requests_filepath.replace(".jsonl", "_results.jsonl")
+    request_url = "https://api.openai.com/v1/chat/completions"
+
+    max_requests_per_minute = 200
+    max_tokens_per_minute = 4000
+    max_attempts = 5
+    logging_level = 10
+
+    asyncio.run(
+    process_api_requests_from_file(
+        requests_filepath=requests_filepath,
+        save_filepath=save_filepath,
+        request_url=request_url,
+        api_key=api_key,
+        max_requests_per_minute=float(max_requests_per_minute),
+        max_tokens_per_minute=float(max_tokens_per_minute),
+        token_encoding_name="cl100k_base",
+        max_attempts=int(max_attempts),
+        logging_level=int(logging_level),
+    )
+    )
+    # read save_filepath and print results
+    with open(save_filepath, 'r') as f:
+        responses = [json.loads(line) for line in f]
+    st.write(responses)
+
+
+
+
 # Streamlit UI layout
 st.title('Parallel Prompts - Execute OpenAI API Requests simultanously')
 
 # api key input box
-api_key = st.text_input("OpenAI API Key")
+api_key = st.text_input("OpenAI API Key", type="password")
 
 # Choose input method
 input_method = st.radio("Choose input method:", ('Upload CSV File', 'Textbox Input'))
@@ -117,6 +152,10 @@ else:
 
 # # Load button
 # Execute button (only visible after loading data)
+    
+if st.button('Test Run'):
+    test_run(api_key)
+    st.success("Test Run Completed.")
 
 if st.button('Execute Prompts'):
     t_start = time.time()
