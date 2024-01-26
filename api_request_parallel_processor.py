@@ -1,4 +1,17 @@
 """
+Adapted from OpenAI Cookbook
+
+MIT License
+
+Copyright (c) 2023 OpenAI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
 API REQUEST PARALLEL PROCESSOR
 
 Using the OpenAI API to process lots of text quickly takes some care.
@@ -95,12 +108,17 @@ The script is structured as follows:
 import aiohttp  # for making API calls concurrently
 import argparse  # for running script from command line
 import asyncio  # for running API calls concurrently
+from io import BytesIO
 import json  # for saving results to a jsonl file
 import logging  # for logging rate limit warnings and other messages
+from math import ceil  # for counting image tokens
 import os  # for reading API key
+from PIL import Image  # for counting image tokens
 import re  # for matching endpoint from request URL
+import requests
 import tiktoken  # for counting tokens
 import time  # for sleeping after rate limit is hit
+
 from dataclasses import (
     dataclass,
     field,
@@ -117,6 +135,7 @@ async def process_api_requests_from_file(
     token_encoding_name: str,
     max_attempts: int,
     logging_level: int,
+    sort_results: bool,
 ):
     """Processes API requests in parallel, throttling to stay under rate limits."""
     # constants
@@ -256,11 +275,21 @@ async def process_api_requests_from_file(
                     logging.warn(
                         f"Pausing to cool down until {time.ctime(status_tracker.time_of_last_rate_limit_error + seconds_to_pause_after_rate_limit_error)}"
                     )
+        
+        # after finishing, sort results based on task_id and remove task_id
+        if sort_results:
+            sort_newly_appended_rows_by_taskid(save_filepath, status_tracker.num_tasks_started)
+        remove_task_ids(save_filepath) # removes task ids from lines
 
-        # after finishing, log final status
-        logging.info(
-            f"""Parallel processing complete. Results saved to {save_filepath}"""
-        )
+        if not sort_results:
+            logging.info(
+                f"Parallel processing complete. Results saved to {save_filepath}. Note that the order may differ from input, use --sort_results flag to sort."
+            )
+        else:
+            logging.info(
+                f"Parallel processing complete. Results sorted and saved to {save_filepath}."
+            )
+        
         if status_tracker.num_tasks_failed > 0:
             logging.warning(
                 f"{status_tracker.num_tasks_failed} / {status_tracker.num_tasks_started} requests failed. Errors logged to {save_filepath}."
@@ -344,18 +373,18 @@ class APIRequest:
                     f"Request {self.request_json} failed after all attempts. Saving errors: {self.result}"
                 )
                 data = (
-                    [self.request_json, [str(e) for e in self.result], self.metadata]
+                    [self.request_json, [str(e) for e in self.result], self.metadata, self.task_id] # task_id for sorting, is removed later
                     if self.metadata
-                    else [self.request_json, [str(e) for e in self.result]]
+                    else [self.request_json, [str(e) for e in self.result], self.task_id]
                 )
                 append_to_jsonl(data, save_filepath)
                 status_tracker.num_tasks_in_progress -= 1
                 status_tracker.num_tasks_failed += 1
         else:
             data = (
-                [self.request_json, response, self.metadata]
+                [self.request_json, response, self.metadata, self.task_id]
                 if self.metadata
-                else [self.request_json, response]
+                else [self.request_json, response, self.task_id]
             )
             append_to_jsonl(data, save_filepath)
             status_tracker.num_tasks_in_progress -= 1
@@ -396,15 +425,24 @@ def num_tokens_consumed_from_request(
         completion_tokens = n * max_tokens
 
         # chat completions
-        if api_endpoint.startswith("chat/"):
+        if api_endpoint.startswith("chat/"):    
             num_tokens = 0
-            for message in request_json["messages"]:
-                num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
-                for key, value in message.items():
-                    num_tokens += len(encoding.encode(value))
-                    if key == "name":  # if there's a name, the role is omitted
-                        num_tokens -= 1  # role is always required and always 1 token
-            num_tokens += 2  # every reply is primed with <im_start>assistant
+            if "vision" in request_json["model"]:
+                for message_content in request_json["messages"][0]["content"]:
+                    if message_content["type"] == "image_url":
+                        url = message_content["image_url"]["url"]
+                        w, h = width_height_from_url(url)
+                        num_tokens += count_image_tokens(w, h)
+                    elif message_content["type"] == "text":
+                        num_tokens += len(encoding.encode(message_content["text"]))
+            else:
+                for message in request_json["messages"]:
+                    num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
+                    for key, value in message.items():
+                        num_tokens += len(encoding.encode(value))
+                        if key == "name":  # if there's a name, the role is omitted
+                            num_tokens -= 1  # role is always required and always 1 token
+                num_tokens += 2  # every reply is primed with <im_start>assistant
             return num_tokens + completion_tokens
         # normal completions
         else:
@@ -449,6 +487,47 @@ def task_id_generator_function():
         task_id += 1
 
 
+def sort_newly_appended_rows_by_taskid(jsonl_file, n_rows):
+    """Sorts a jsonl file based on the last element (task_id) of each line.
+    Only sorts the rows that were appended in the current run."""
+    with open(jsonl_file, 'r') as f:
+        lines = [json.loads(line) for line in f]
+    lines_to_not_sort = lines[:-n_rows] # these lines are from previous runs
+    lines_to_sort = lines[-n_rows:]
+    lines_to_sort.sort(key=lambda x: x[-1])
+    lines_out = lines_to_not_sort + lines_to_sort
+    with open(jsonl_file, 'w') as f:
+        for line in lines_out:
+            f.write(json.dumps(line) + '\n')
+    
+
+def remove_task_ids(jsonl_file):
+    """Removes the last element (task_id used for sorting) of each line from the jsonl file."""
+    with open(jsonl_file, 'r') as f:
+        lines = [json.loads(line) for line in f]
+    lines = [line[:-1] if isinstance(line[-1], int) else line for line in lines]
+    with open(jsonl_file, 'w') as f:
+        for line in lines:
+            f.write(json.dumps(line) + '\n')
+
+
+def width_height_from_url(image_url):
+    """Returns the width and height of an image from the URL."""
+    response = requests.get(image_url)
+    response.raise_for_status()  # Raise an error if the download failed
+    with Image.open(BytesIO(response.content)) as image:
+        return image.width, image.height
+
+
+def count_image_tokens(width, height):
+    """counts tokens associated with image (w*h) according to pricing page, 15 jan 2023"""
+    h = ceil(height / 512)
+    w = ceil(width / 512)
+    n = w * h
+    total = 85 + 170 * n
+    return total
+
+
 # run script
 
 
@@ -464,6 +543,7 @@ if __name__ == "__main__":
     parser.add_argument("--token_encoding_name", default="cl100k_base")
     parser.add_argument("--max_attempts", type=int, default=5)
     parser.add_argument("--logging_level", default=logging.INFO)
+    parser.add_argument("--sort_results", action='store_true')
     args = parser.parse_args()
 
     if args.save_filepath is None:
@@ -481,28 +561,7 @@ if __name__ == "__main__":
             token_encoding_name=args.token_encoding_name,
             max_attempts=int(args.max_attempts),
             logging_level=int(args.logging_level),
+            sort_results=args.sort_results,
         )
     )
 
-
-"""
-APPENDIX
-
-The example requests file at openai-cookbook/examples/data/example_requests_to_parallel_process.jsonl contains 10,000 requests to text-embedding-ada-002.
-
-It was generated with the following code:
-
-```python
-import json
-
-filename = "data/example_requests_to_parallel_process.jsonl"
-n_requests = 10_000
-jobs = [{"model": "text-embedding-ada-002", "input": str(x) + "\n"} for x in range(n_requests)]
-with open(filename, "w") as f:
-    for job in jobs:
-        json_string = json.dumps(job)
-        f.write(json_string + "\n")
-```
-
-As with all jsonl files, take care that newlines in the content are properly escaped (json.dumps does this automatically).
-"""
