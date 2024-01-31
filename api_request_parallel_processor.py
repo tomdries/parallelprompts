@@ -82,6 +82,8 @@ Inputs:
     - 20 = INFO; will log when requests start and the status at finish
     - 10 = DEBUG; will log various things as the loop runs to see when they occur
     - if omitted, will default to 20 (INFO).
+- sort_results
+    -sorts the result jsonl file in same order as input jsonl file.
 
 The script is structured as follows:
     - Imports
@@ -118,6 +120,7 @@ import re  # for matching endpoint from request URL
 import requests
 import tiktoken  # for counting tokens
 import time  # for sleeping after rate limit is hit
+import base64
 
 from dataclasses import (
     dataclass,
@@ -511,11 +514,21 @@ def remove_task_ids(jsonl_file):
             f.write(json.dumps(line) + '\n')
 
 
-def width_height_from_url(image_url):
-    """Returns the width and height of an image from the URL."""
-    response = requests.get(image_url)
-    response.raise_for_status()  # Raise an error if the download failed
-    with Image.open(BytesIO(response.content)) as image:
+def width_height_from_url(image_url_or_base64):
+    """Returns the width and height of an image from the URL or base64 string."""
+    if image_url_or_base64.startswith(('http://', 'https://')):
+        # Handle as URL
+        response = requests.get(image_url_or_base64)
+        response.raise_for_status()  # Raise an error if the download failed
+        image_data = response.content
+    elif image_url_or_base64.startswith('data:image'):
+        # Handle as base64 encoded image
+        header, encoded = image_url_or_base64.split(",", 1)
+        image_data = base64.b64decode(encoded)
+    else:
+        raise ValueError("Invalid image URL or base64 data")
+
+    with Image.open(BytesIO(image_data)) as image:
         return image.width, image.height
 
 
@@ -564,4 +577,3 @@ if __name__ == "__main__":
             sort_results=args.sort_results,
         )
     )
-
